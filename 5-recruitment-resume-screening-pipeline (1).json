@@ -1,0 +1,523 @@
+{
+  "name": "Recruitment Resume Screening Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "job-application",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "de1f8bba-6f00-45f2-8333-5b630fd2072b",
+      "name": "Webhook: Application In",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "f84f1321-0e52-4ad6-91ef-57a36544a872"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// =========================== CONFIG ===========================\nconst JOB = {\n  title: \"Senior n8n / Automation Engineer\",\n  mustHaveSkills: [\"n8n\", \"API integration\", \"JavaScript\", \"workflow automation\"],\n  niceToHaveSkills: [\"Python\", \"Notion API\", \"OpenAI API\", \"Zapier/Make experience\"],\n  minExperienceYears: 2,\n  description: \"We're hiring an automation engineer to design, build and maintain n8n workflows that connect our CRM, support, and finance tools. Strong API integration and JavaScript skills required.\"\n};\nconst SHORTLIST_THRESHOLD = 75;   // score out of 100\nconst RECRUITER_EMAIL = \"recruiter@yourcompany.com\";\n// ================================================================\n\nconst j = $input.item.json.body || $input.item.json;\nconst required = [\"name\", \"email\", \"resumeText\"];\nconst missing = required.filter(k => !j[k]);\nif (missing.length) throw new Error(\"Missing required application fields: \" + missing.join(\", \"));\n\nconst system = `You are a resume screener. Compare the candidate's resume against the job requirements and return ONLY valid JSON with this exact shape:\n{\n  \"candidate_name\": \"string\",\n  \"total_experience_years\": number,\n  \"key_skills_matched\": [\"...\"],\n  \"key_skills_missing\": [\"...\"],\n  \"education_summary\": \"one line\",\n  \"score\": number (0-100, weighted toward must-have skills and minimum experience),\n  \"recommendation\": \"Shortlist\" | \"Review\",\n  \"summary\": \"2-3 sentence objective summary of fit, no opinions on the person, only on qualifications\"\n}\nRules: base every field strictly on the resume text provided. Never invent experience, skills, or credentials not present in the text. If information is missing from the resume, note it as missing rather than guessing. Score conservatively when evidence is thin. \"recommendation\" is \"Shortlist\" only if score >= ${SHORTLIST_THRESHOLD} AND all must-have skills are present or clearly transferable; otherwise \"Review\".`;\n\nconst userMsg = `Job: ${JOB.title}\nDescription: ${JOB.description}\nMust-have skills: ${JOB.mustHaveSkills.join(\", \")}\nNice-to-have skills: ${JOB.niceToHaveSkills.join(\", \")}\nMinimum experience: ${JOB.minExperienceYears} years\n\nCandidate name (from form): ${j.name}\nCandidate email (from form): ${j.email}\nCandidate phone (from form): ${j.phone || \"not provided\"}\nRole applied for: ${j.roleAppliedFor || JOB.title}\n\nResume text:\n${j.resumeText.slice(0, 20000)}`;\n\nconst aiRequest = {\n  model: \"gpt-4o-mini\",\n  temperature: 0.1,\n  response_format: { type: \"json_object\" },\n  messages: [\n    { role: \"system\", content: system },\n    { role: \"user\", content: userMsg }\n  ]\n};\n\nreturn { json: {\n  aiRequest,\n  meta: {\n    formName: j.name, formEmail: j.email, formPhone: j.phone || \"\",\n    roleAppliedFor: j.roleAppliedFor || JOB.title,\n    resumeUrl: j.resumeUrl || \"\",\n    appliedDate: new Date().toISOString().slice(0, 10),\n    shortlistThreshold: SHORTLIST_THRESHOLD,\n    recruiterEmail: RECRUITER_EMAIL,\n    jobTitle: JOB.title\n  }\n}};"
+      },
+      "id": "ff7df314-4d18-4e23-a358-dc7cb1dda4e6",
+      "name": "Prepare Screening Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.aiRequest) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "e952c789-676d-4b4c-acb6-b610929248b2",
+      "name": "AI: Score Resume",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        0
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_ME",
+          "name": "OpenAI account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const res = $input.first().json;\nconst meta = $('Prepare Screening Prompt').first().json.meta;\nlet data;\ntry { data = JSON.parse(res.choices[0].message.content); }\ncatch (e) { throw new Error('AI returned invalid JSON: ' + e.message); }\n\nconst score = Math.max(0, Math.min(100, Number(data.score) || 0));\nconst shortlisted = score >= meta.shortlistThreshold && data.recommendation === \"Shortlist\";\n\nreturn [{ json: {\n  name: data.candidate_name || meta.formName,\n  email: meta.formEmail,\n  phone: meta.formPhone,\n  roleAppliedFor: meta.roleAppliedFor,\n  experienceYears: Number(data.total_experience_years) || 0,\n  skillsMatched: (data.key_skills_matched || []).join(\", \"),\n  skillsMissing: (data.key_skills_missing || []).join(\", \"),\n  education: data.education_summary || \"\",\n  score,\n  recommendation: shortlisted ? \"Shortlist\" : \"Review\",\n  shortlisted,\n  summary: data.summary || \"\",\n  resumeUrl: meta.resumeUrl,\n  appliedDate: meta.appliedDate,\n  jobTitle: meta.jobTitle,\n  recruiterEmail: meta.recruiterEmail\n}}];"
+      },
+      "id": "e5e23cfa-5358-474e-a4e5-6d37337fc361",
+      "name": "Parse Candidate Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "create",
+        "databaseId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_CANDIDATES_DATABASE_ID",
+          "mode": "id"
+        },
+        "title": "={{ $json.name }}",
+        "propertiesUi": {
+          "propertyValues": [
+            {
+              "key": "Email|email",
+              "emailValue": "={{ $json.email }}"
+            },
+            {
+              "key": "Phone|rich_text",
+              "textContent": "={{ $json.phone }}"
+            },
+            {
+              "key": "Role|rich_text",
+              "textContent": "={{ $json.roleAppliedFor }}"
+            },
+            {
+              "key": "Score|number",
+              "numberValue": "={{ $json.score }}"
+            },
+            {
+              "key": "Experience Years|number",
+              "numberValue": "={{ $json.experienceYears }}"
+            },
+            {
+              "key": "Recommendation|select",
+              "selectValue": "={{ $json.recommendation }}"
+            },
+            {
+              "key": "Skills Matched|rich_text",
+              "textContent": "={{ $json.skillsMatched }}"
+            },
+            {
+              "key": "Skills Missing|rich_text",
+              "textContent": "={{ $json.skillsMissing }}"
+            },
+            {
+              "key": "Summary|rich_text",
+              "textContent": "={{ $json.summary }}"
+            },
+            {
+              "key": "Resume Link|url",
+              "urlValue": "={{ $json.resumeUrl }}"
+            },
+            {
+              "key": "Applied Date|date",
+              "includeTime": false,
+              "date": "={{ $json.appliedDate }}"
+            },
+            {
+              "key": "Status|select",
+              "selectValue": "New"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "3d1f9dfe-bbfa-4acf-88c5-7e0272193954",
+      "name": "Notion: Create Candidate",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        0
+      ],
+      "credentials": {
+        "notionApi": {
+          "id": "REPLACE_ME",
+          "name": "Notion account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "e67eb001-bcd7-427a-af61-4a1a54c020ec",
+              "leftValue": "={{ $('Parse Candidate Score').item.json.shortlisted }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "21385e29-7b31-49e1-9cb4-45ff5147fc0f",
+      "name": "IF: Meets Shortlist Bar",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const c = $('Parse Candidate Score').item.json;\nconst esc = s => String(s ?? '').replace(/[&<>\"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;' }[ch]));\nconst html = `<div style=\"font-family:Arial,sans-serif;font-size:14px;color:#222\">\n<p>Hi ${esc(c.name)},</p>\n<p>Thank you for applying for <b>${esc(c.jobTitle)}</b> \u2014 your background looks like a strong match, and we'd love to talk further.</p>\n<p>Please use this link to book a 30-minute interview slot at a time that works for you: <a href=\"REPLACE_WITH_SCHEDULING_LINK\">Schedule your interview</a></p>\n<p>Looking forward to speaking with you.</p>\n<p>Best,<br>Hiring Team</p>\n</div>`;\nreturn [{ json: { to: c.email, subject: `Next step: interview for ${c.jobTitle}`, html } }];"
+      },
+      "id": "539c20e3-0d31-4c12-a921-64917bd0ef29",
+      "name": "Build Shortlist Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "emailType": "html",
+        "message": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "6e8dbdc4-f136-47ab-8292-a1c0e7a251b6",
+      "name": "Gmail: Send Shortlist Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1680,
+        -160
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "calendar": {
+          "__rl": true,
+          "value": "primary",
+          "mode": "list"
+        },
+        "start": "={{ $now.plus({days: 3}).set({hour: 14, minute: 0}).toISO() }}",
+        "end": "={{ $now.plus({days: 3}).set({hour: 14, minute: 30}).toISO() }}",
+        "additionalFields": {
+          "summary": "={{ 'Interview hold: ' + $('Parse Candidate Score').first().json.name }}",
+          "description": "={{ 'Tentative interview slot pending candidate confirmation via scheduling link. Role: ' + $('Parse Candidate Score').first().json.jobTitle }}"
+        }
+      },
+      "id": "ed615686-33c7-4a13-aabe-6aace2525323",
+      "name": "Google Calendar: Hold Interview Slot",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        1440,
+        -40
+      ],
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Calendar account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const c = $('Parse Candidate Score').item.json;\nconst esc = s => String(s ?? '').replace(/[&<>\"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;' }[ch]));\nconst html = `<div style=\"font-family:Arial,sans-serif;font-size:14px;color:#222\">\n<h3>New shortlisted candidate: ${esc(c.name)}</h3>\n<p>Role: ${esc(c.jobTitle)} \u00b7 Score: ${esc(c.score)}/100 \u00b7 Experience: ${esc(c.experienceYears)} yrs</p>\n<p><b>Matched skills:</b> ${esc(c.skillsMatched)}</p>\n<p><b>Missing skills:</b> ${esc(c.skillsMissing) || 'none flagged'}</p>\n<p><b>AI summary:</b> ${esc(c.summary)}</p>\n<p>Full record is in the Candidates Notion database. An interview invite has been sent to the candidate.</p>\n</div>`;\nreturn [{ json: { to: c.recruiterEmail, subject: `Shortlisted: ${c.name} - ${c.jobTitle} (${c.score}/100)`, html } }];"
+      },
+      "id": "2d8eed90-55ce-4393-9ab5-7491a5752ec6",
+      "name": "Build Recruiter Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "emailType": "html",
+        "message": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "4dbe4bd2-2f33-4caa-96f3-2f026866d1e8",
+      "name": "Gmail: Notify Recruiter",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1920,
+        80
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const c = $('Parse Candidate Score').item.json;\nconst esc = s => String(s ?? '').replace(/[&<>\"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;' }[ch]));\nconst html = `<div style=\"font-family:Arial,sans-serif;font-size:14px;color:#222\">\n<p>Hi ${esc(c.name)},</p>\n<p>Thanks for applying for <b>${esc(c.jobTitle)}</b>. We've received your application and resume, and our team is reviewing it now.</p>\n<p>If your experience looks like a good match, we'll reach out within the next few business days to schedule a conversation. We appreciate your interest and the time you took to apply.</p>\n<p>Best,<br>Hiring Team</p>\n</div>`;\nreturn [{ json: { to: c.email, subject: `We've received your application for ${c.jobTitle}`, html } }];"
+      },
+      "id": "889d16f8-eedf-497d-93ef-ccf06c8365f9",
+      "name": "Build Acknowledgment Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "emailType": "html",
+        "message": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "e69e44ee-b3f1-4308-917d-39b3d8b9b0b6",
+      "name": "Gmail: Send Acknowledgment Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1680,
+        260
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "bd10210c-aa02-4008-85ba-31baee8304ae",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "admin@yourcompany.com",
+        "subject": "={{ 'Recruitment pipeline failure: ' + $json.workflow.name }}",
+        "emailType": "text",
+        "message": "={{ 'Workflow: ' + $json.workflow.name + '\\nFailed node: ' + $json.execution.lastNodeExecuted + '\\nError: ' + $json.execution.error.message + '\\nExecution: ' + $json.execution.url }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "3cde6c2c-0587-44d8-a6ae-222de1bf44dc",
+      "name": "Gmail: Alert Admin",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        240,
+        500
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "Gmail account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook: Application In": {
+      "main": [
+        [
+          {
+            "node": "Prepare Screening Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Screening Prompt": {
+      "main": [
+        [
+          {
+            "node": "AI: Score Resume",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Score Resume": {
+      "main": [
+        [
+          {
+            "node": "Parse Candidate Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Candidate Score": {
+      "main": [
+        [
+          {
+            "node": "Notion: Create Candidate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion: Create Candidate": {
+      "main": [
+        [
+          {
+            "node": "IF: Meets Shortlist Bar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Meets Shortlist Bar": {
+      "main": [
+        [
+          {
+            "node": "Build Shortlist Email",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Google Calendar: Hold Interview Slot",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Acknowledgment Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Shortlist Email": {
+      "main": [
+        [
+          {
+            "node": "Gmail: Send Shortlist Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail: Send Shortlist Email": {
+      "main": [
+        [
+          {
+            "node": "Build Recruiter Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Recruiter Notification": {
+      "main": [
+        [
+          {
+            "node": "Gmail: Notify Recruiter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Acknowledgment Email": {
+      "main": [
+        [
+          {
+            "node": "Gmail: Send Acknowledgment Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Gmail: Alert Admin",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata"
+  },
+  "tags": []
+}
